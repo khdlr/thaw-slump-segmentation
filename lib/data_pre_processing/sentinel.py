@@ -1,10 +1,10 @@
 from pathlib import Path
 import json
-import rasterio as rio
 from rasterio.features import rasterize
 import math
 import numpy as np
 import xarray as xr
+import rioxarray
 import pandas as pd
 import geopandas as gpd
 import ee
@@ -16,7 +16,8 @@ from .earthengine import get_ArcticDEM_rel_el, get_ArcticDEM_slope
 
 
 SHAPEFILE_ROOT = Path('data/ML_training_labels/retrogressive_thaw_slumps/')
-OUTFOLDER = Path('data/Sentinel2') 
+CACHEFOLDER = Path('data/S2Cache')
+OUTFOLDER = Path('data/S2Scenes')
 TILESIZE = 192
 
 BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B10', 'B11', 'B12']
@@ -24,18 +25,32 @@ BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B10', 'B1
 lookback  = pd.Timedelta(days=5)
 lookahead = pd.Timedelta(days=5)
 
-def burn_mask(gdf, shape, profile):
-  mask = rasterize(gdf.geometry.to_crs(profile['crs']),
-        out_shape=shape, transform=profile['transform'])
-  return rearrange(mask, 'H W -> 1 H W')
+def burn_mask(gdf, master):
+  mask = rasterize(gdf.geometry.to_crs(master.rio.crs),
+      out_shape=master.shape[-2:], transform=master.rio.transform())
+  mask = rearrange(mask, 'H W -> 1 H W')
+  mask = xr.DataArray(mask,
+      coords={
+        'band': [1],
+        'y': master.coords['y'],
+        'x': master.coords['x'],
+      },
+      attrs={
+        'long_name': 'mask',
+      }
+  )
+  mask.coords['spatial_ref'] = master.coords['spatial_ref']
 
-def tile_data(datasets, master='Sentinel2'):
+  return mask
+
+
+def tile_data(datasets):
   tiles = {d: [] for d in datasets}
   H, W = list(datasets.values())[0].shape[1:]
   y_vals = np.linspace(0, H-TILESIZE, int(math.ceil(H / TILESIZE)))
   x_vals = np.linspace(0, W-TILESIZE, int(math.ceil(W / TILESIZE)))
 
-  for y0 in y_vals: 
+  for y0 in y_vals:
     for x0 in x_vals:
       y0, x0 = int(y0), int(x0)
       for d in datasets:
@@ -45,6 +60,13 @@ def tile_data(datasets, master='Sentinel2'):
   for d in tiles:
     stacks[d] = np.stack(tiles[d])
   return stacks
+
+
+def extract_and_rename_bands(dataarray, bands, band_name):
+  indices = [dataarray.long_name.index(b) for b in bands]
+  subset = dataarray.isel(band=indices)
+  subset.attrs['long_name'] = tuple(dataarray.long_name[i] for i in indices)
+  return subset.rename(band=band_name)
 
 
 def get_s2_scene(data):
@@ -60,10 +82,10 @@ def get_s2_scene(data):
   centroid_x = 0.5 * (minx + maxx)
   UTMZone = int(math.ceil((180 + centroid_x) / 6))
   CRS = f'EPSG:326{UTMZone:02d}'
-  geom = gpd.GeoSeries(geometry, crs='EPSG:4326').to_crs(CRS)[0]
+  geom = gpd.GeoSeries(geometry, crs='EPSG:4326').to_crs(CRS)
 
   # Define ROI as a ee Geometry
-  bounds = ee.Geometry.Polygon(list(geom.exterior.coords), proj=CRS, evenOdd=False)
+  bounds = ee.Geometry.Polygon(list(geom[0].exterior.coords), proj=CRS, evenOdd=False)
 
   imgs = s2.search(
     start_date=image_date - lookback,  # Select starting `lookback` days before PSOrthoTile
@@ -73,10 +95,8 @@ def get_s2_scene(data):
     custom_filter='CLOUDY_PIXEL_PERCENTAGE < 20'  # Filter Scenes with too many clouds
   )
 
-  out_dir = Path(f'data/Sentinel2/{image_id}')
+  out_dir = CACHEFOLDER / image_id
   out_dir.mkdir(parents=True, exist_ok=True)
-  tiles_path = Path(f'data/S2Tiles/{image_id}.nc')
-  tiles_path.parent.mkdir(parents=True, exist_ok=True)
   print(f'Found {len(imgs.properties)} scenes for {image_id}')
 
   def get_aux_data(name, crs, ee_image):
@@ -89,51 +109,52 @@ def get_s2_scene(data):
           scale=10,
       )
 
-    with rio.open(out_path) as raster:
-      data = raster.read()
-      if raster.descriptions[-1] == 'FILL_MASK':
-        data = data[:-1]
+    data = rioxarray.open_rasterio(out_path)
     return data
 
-  stacks = []
   for img in imgs.properties:
     s2_id = img.split('/')[-1]
-    outpath = out_dir / f'{s2_id}.tif'
+    s2path = out_dir / f'{s2_id}.tif'
+    full_scene_path = OUTFOLDER / f'{image_id}_{s2_id}.nc'
 
-    if not outpath.exists():
+    if not s2path.exists():
       # By default, geedim downloads scenes at native resolution and CRS
-      gd.MaskedImage.from_id(img).download(outpath, region=bounds)
+      gd.MaskedImage.from_id(img).download(s2path, region=bounds)
 
       # Save S2 image metadata, we might need that later
-      with outpath.with_suffix('.json').open('w') as f:
+      with s2path.with_suffix('.json').open('w') as f:
         json.dump(imgs.properties[img], f)
 
-    with rio.open(outpath) as s2raster:
-      profile = s2raster.profile
-      datasets = {
-        'Sentinel2': s2raster.read()[:13].astype(np.uint16),
-      }
-    with rio.open(outpath) as raster:
-      crs = raster.crs
+    # TODO: Why does casting to uint16 destroy the geo-referencing?
+    s2 = rioxarray.open_rasterio(s2path)# .astype(np.uint16)
+    s2 = extract_and_rename_bands(s2, ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B10', 'B11', 'B12'], 's2_band')
+    TCVIS = ee.ImageCollection("users/ingmarnitze/TCTrend_SR_2000-2019_TCVIS").mosaic()
 
-    datasets['TCVIS'] = get_aux_data('TCVIS',
-        crs, ee.ImageCollection("users/ingmarnitze/TCTrend_SR_2000-2019_TCVIS").mosaic())
-    datasets['RelativeElevation'] = get_aux_data('RelativeElevation', crs, get_ArcticDEM_rel_el())
-    datasets['Slope'] = get_aux_data('Slope', crs, get_ArcticDEM_slope())
-    datasets['Mask'] = burn_mask(labels[labels.image_id == image_id], s2raster.shape, profile)
+    tcvis = get_aux_data('TCVIS', s2.rio.crs, TCVIS)
+    tcvis = extract_and_rename_bands(tcvis, ['TCB_slope', 'TCG_slope', 'TCW_slope'], 'tcvis_band')
 
-    stacks.append(tile_data(datasets))
+    relative_elevation = get_aux_data('RelativeElevation', s2.rio.crs, get_ArcticDEM_rel_el())
+    relative_elevation = extract_and_rename_bands(relative_elevation, ['elevation'], 'relative_elevation_band')
 
-  data = {}
-  for stack in stacks:
-    for var in stack:
-      if var in data:
-        data[var] = np.concatenate([data[var], stack[var]], axis=0)
-      else:
-        data[var] = stack[var]
+    slope = get_aux_data('Slope', s2.rio.crs, get_ArcticDEM_slope())
+    slope = extract_and_rename_bands(slope, ['slope'], 'slope_band')
 
-  dataset = xr.Dataset({d: xr.DataArray(data[d], dims=['sample', f'{d}_band', 'y', 'x']) for d in data})
-  dataset.to_netcdf(tiles_path, engine='h5netcdf')
+    mask = burn_mask(labels[labels.image_id == image_id], s2).rename(band='mask_band')
+    valid_label = burn_mask(geom, s2).rename(band='valid_label_band')
+
+    dataset = xr.Dataset({
+      'Sentinel2': s2,
+      'TCVIS': tcvis,
+      'RelativeElevation': relative_elevation,
+      'Slope': slope,
+      'Mask': mask,
+      'ValidLabel': valid_label,
+    })
+
+    # dataset = dataset.chunk({'y': 192, 'x': 192})
+    full_scene_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset.to_netcdf(full_scene_path, format='NETCDF4', engine='h5netcdf')
+
 
 if __name__ == '__main__':
   # Build JoinTable to get date from image_id
@@ -147,5 +168,4 @@ if __name__ == '__main__':
   scenes = scenes[scenes.image_id.isin(labels.image_id)]
   scenes['image_date'] = scenes['image_id'].apply(id2date.get)
 
-  # get_s2_scene(scenes.iloc[0])
   Parallel(n_jobs=4)(delayed(get_s2_scene)(row) for _, row in scenes.iterrows())

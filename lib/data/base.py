@@ -27,28 +27,28 @@ class EETileSource(TileSource):
     def get_raster_data(self, scene: 'Scene') -> xr.DataArray:
         _cache_path = cache_path(class_name(self), f'{scene.id}.tif')
         _cache_path.parent.mkdir(parents=True, exist_ok=True)
+
         if not _cache_path.exists():
-            self.download_tile(_cache_path, scene)
-
-        data = rioxarray.open_rasterio(_cache_path)
-        data = data.isel(band=slice(0, -1))
-        data = data.rename(band=f'{class_name(self)}_band')
-        return data
-
-    def download_tile(self, out_path, scene):
-        if not out_path.exists():
             gd.Initialize()
             img = gd.MaskedImage(self.get_ee_image())
-
-            img.download(out_path,
+            safe_download(img, _cache_path,
                 region=scene.ee_bounds().getInfo(),
                 crs=str(scene.crs),
                 crs_transform=scene.transform,
                 shape=scene.size,
             )
 
+        data = rioxarray.open_rasterio(_cache_path)
+        data = data.isel(band=slice(0, -1))
+        data = data.rename(band=f'{class_name(self)}_band')
+        return data
+
     @abstractmethod
     def get_ee_image(self):
+        ...
+
+    @abstractmethod
+    def get_dtype(self):
         ...
 
 
@@ -146,3 +146,20 @@ def cache_path(prefix, filename):
 
 def class_name(obj):
     return type(obj).__name__
+
+
+def safe_download(img, out_path, **kwargs):
+    if out_path.exists():
+        raise FileExistsError("Output file exists: {out_path}")
+    tmp_path = out_path.parent / f'{out_path.stem}_incomplete{out_path.suffix}'
+    if tmp_path.exists():
+        # Incomplete Download (i.e. script crashed earlier)
+        tmp_path.unlink()
+        print(f'Removing incomplete download at {tmp_path}')
+        # TODO: Debug Log Message
+    img.download(tmp_path, **kwargs)
+    tmp_path.rename(out_path)
+
+
+
+

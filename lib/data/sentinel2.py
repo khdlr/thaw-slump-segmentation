@@ -3,7 +3,7 @@ import rioxarray
 import ee
 import geedim as gd
 
-from .base import TileSource, Scene, cache_path
+from .base import TileSource, Scene, cache_path, safe_download
 
 
 class Sentinel2(TileSource):
@@ -29,7 +29,7 @@ class Sentinel2(TileSource):
         if not out_path.exists():
             gd.Initialize()
             img = gd.MaskedImage.from_id(s2sceneid)
-            img.download(out_path,
+            safe_download(img, out_path,
                 region=bounds.getInfo(),
                 crs=None if crs is None else str(crs),
                 scale=10,

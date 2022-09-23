@@ -37,6 +37,7 @@ class Sentinel2(TileSource):
 
     @staticmethod
     def build_scenes(bounds, crs, start_date, end_date, prefix, min_coverage=90, max_cloudy_pixels=20):
+        gd.Initialize()
         s2 = ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
         s2 = gd.MaskedCollection(s2)
 
@@ -59,6 +60,7 @@ class Sentinel2(TileSource):
             s2_id = img.split('/')[-1]
             scene_id = f'{prefix}_{s2_id}'
             _cache_path = cache_path('Sentinel2', f'{scene_id}.tif')
+            Sentinel2.download_tile(_cache_path, img, bounds)
             ds = rioxarray.open_rasterio(_cache_path, decode_coords='all')
 
             scene = Scene(

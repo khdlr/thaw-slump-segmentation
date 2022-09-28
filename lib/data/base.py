@@ -141,7 +141,9 @@ class Scene:
 # UTILS
 
 def cache_path(prefix, filename):
-    return _root_path / 'cache' / prefix / filename
+    _cache_path = _root_path / 'cache' / prefix / filename
+    _cache_path.parent.mkdir(exist_ok=True, parents=True)
+    return _cache_path
 
 
 def class_name(obj):

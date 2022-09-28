@@ -2,6 +2,7 @@ import xarray as xr
 import rioxarray
 import ee
 import geedim as gd
+import pandas as pd
 
 from .base import TileSource, Scene, cache_path, safe_download
 
@@ -22,13 +23,16 @@ class Sentinel2(TileSource):
         # But other tools don't seem to be compatible with that (i.e. QGIS)
         # data = data.assign_coords({'band': list(data.long_name[:13])})
         data = data.rename(band='Sentinel2_band')
+        data.attrs['date'] = pd.to_datetime(scene.id.split('_')[-3])
         return data
 
     @staticmethod
     def download_tile(out_path, s2sceneid, bounds, crs=None):
         if not out_path.exists():
             gd.Initialize()
-            img = gd.MaskedImage.from_id(s2sceneid)
+            img = ee.Image(s2sceneid)
+            img = img.select(['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B10','B11','B12'])
+            img = gd.MaskedImage(img)
             safe_download(img, out_path,
                 region=bounds.getInfo(),
                 crs=None if crs is None else str(crs),

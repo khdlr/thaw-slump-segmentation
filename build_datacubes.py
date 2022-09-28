@@ -11,9 +11,13 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import os
+from collections import defaultdict
+import xarray
+from tqdm import tqdm
 
 import pandas as pd
 import geopandas as gpd
+from shapely.ops import unary_union
 from joblib import Parallel, delayed
 
 from lib import data
@@ -60,18 +64,31 @@ def build_sentinel2_cubes(scene_info, out_dir: Path):
         complete_scene(scene)
         scene.save(out_dir / f'{scene.id}.id')
 
+
 def build_sentinel2_timeseries(scene_info, out_dir: Path):
     data.init_data_paths(out_dir.parent)
-    start_date = pd.to_datetime('2010-01-01')
-    end_date = pd.to_datetime('2030-01-01')
-    # end_date = scene_info.image_date + pd.to_timedelta('5 days')
+    geometry, image_id = scene_info
+    print(f'Starting build for scene {image_id}')
+        
+    start_date = pd.to_datetime('2015-01-01')
+    end_date = pd.to_datetime('2022-09-20')
     scenes = data.Sentinel2.build_scenes(
-        bounds=scene_info.geometry, crs=None, 
+        bounds=geometry, crs='EPSG:3995', 
         start_date=start_date, end_date=end_date,
-        prefix=scene_info.image_id
+        prefix=image_id
     )
-    for scene in scenes:
-        scene.save(out_dir / f'{scene.id}.id')
+
+    x_scenes = defaultdict(list)
+    for scene in tqdm(scenes):
+        xarr = scene.to_xarray()
+        date = xarr.Sentinel2.date
+        xarr = xarr.expand_dims({'time': [date]}, axis=0)
+        x_scenes[scene.crs].append(xarr)
+    for crs in x_scenes:
+      combined = xarray.combine_by_coords(x_scenes[crs], combine_attrs='drop_conflicts')
+      combined.to_netcdf(out_dir / f'{image_id}_{crs}.nc', engine='h5netcdf')
+
+    print(f'Done with build for scene {image_id}')
 
 
 if __name__ == "__main__":
@@ -125,20 +142,24 @@ if __name__ == "__main__":
         shapefile_root = DATA_ROOT / 'ML_training_labels' / 'retrogressive_thaw_slumps'
         out_dir = DATA_ROOT / 's2_timeseries'
 
-        labels = map(gpd.read_file, shapefile_root.glob('*/TrainingLabel*.shp'))
-        labels = pd.concat(labels).reset_index(drop=True)
-        labels['image_date'] = pd.to_datetime(labels['image_date'])
-        id2date = dict(labels[['image_id', 'image_date']].values)
+        scenes = []
+        for p in shapefile_root.glob('*/*Footprints*.shp'):
+            scenes.append(gpd.read_file(p).to_crs('EPSG:3995'))
+        scenes = pd.concat(scenes)
+        scenes['geometry'] = scenes['geometry'].buffer(0)
 
-        scenes = map(gpd.read_file, shapefile_root.glob('*/ImageFootprints*.shp'))
-        scenes = pd.concat(scenes).reset_index(drop=True)
-        scenes = scenes[scenes.image_id.isin(labels.image_id)]
-        scenes['image_date'] = scenes.image_id.apply(id2date.get)
+        sites = unary_union(scenes.geometry)
+        sites = list(sites.geoms)
 
-        scene_info = scenes.loc[:, ['image_id', 'image_date', 'geometry']]
+        site_info = []
+        for site_poly in sites:
+            tiles = scenes[scenes.intersects(site_poly)]
+            site_id = tiles.iloc[tiles.area.argmax()].image_id
+            site_info.append((site_poly, site_id))
+
         if args.n_jobs == 0:
-            for _, info in scene_info.iterrows():
+            for info in site_info:
                 build_sentinel2_timeseries(info, out_dir)
         else:
             Parallel(n_jobs=args.n_jobs)(
-                delayed(build_sentinel2_timeseries)(info, out_dir) for _, info in scene_info.iterrows())
+                delayed(build_sentinel2_timeseries)(info, out_dir) for info in site_info)

@@ -68,11 +68,12 @@ def build_sentinel2_cubes(scene_info, out_dir: Path):
 
 def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Path):
     data.init_data_paths(out_dir.parent)
-    print(f'Starting build for scene {image_id}')
-    print(f'Tiles: {len(tiles)}')
-    print(f'Targets: {len(targets)}')
-    for _, tile in tiles.iterrows():
-      print(f'Tile {tile.image_id}: {(targets.image_id == tile.image_id).sum()}')
+
+    # Get tile dates
+    img2date = dict(zip(targets.image_id, targets.image_date))
+    tiles['image_date'] = tiles.image_id.apply(img2date.get)
+    tiles = tiles.groupby('image_date').agg({'geometry': unary_union}).reset_index().set_crs(tiles.crs)
+    targets.groupby('image_date').agg({'geometry': unary_union}).reset_index().set_crs(targets.crs)
 
     # Build S2 Scenes
     # start_date = pd.to_datetime('2015-01-01')
@@ -99,9 +100,9 @@ def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Pat
       sample_scene = x_scenes[crs][0][0]
       xmasks = []
       for i in tiles.index:
-        tile_targets = targets[targets.image_id == tiles.image_id[i]]
+        tile_targets = targets[targets.image_date == tiles.image_date[i]]
         mask = data.Mask(tile_targets.geometry, tiles.loc[[i]].geometry)
-        mask_scene = data.Scene(f'{tiles.image_id.loc[i]}_{crs}', crs,
+        mask_scene = data.Scene(f'{tiles.image_date.loc[i]}_{crs}', crs,
             sample_scene.transform, sample_scene.size, layers=[mask])
         date = pd.to_datetime(tile_targets.image_date.iloc[0])
         xmask = mask_scene.to_xarray()
@@ -193,9 +194,9 @@ if __name__ == "__main__":
 
         site_info = []
         for site_poly in sites:
-            tiles = scenes[scenes.intersects(site_poly)]
+            tiles = scenes[scenes.intersects(site_poly)].copy()
             site_id = tiles.iloc[tiles.area.argmax()].image_id
-            site_info.append((site_poly, site_id, tiles, targets[targets.image_id.isin(tiles.image_id)]))
+            site_info.append((site_poly, site_id, tiles, targets[targets.image_id.isin(tiles.image_id)].copy()))
 
         if args.n_jobs == 0:
           for info in site_info[7:]:

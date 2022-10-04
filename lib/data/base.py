@@ -19,12 +19,12 @@ def init_data_paths(root_path: Union[str, Path]):
 
 class TileSource(ABC):
     @abstractmethod
-    def get_raster_data(self, scene: 'Scene') -> xr.DataArray:
+    def get_raster_data(self, scene: 'Scene') -> xr.Dataset:
         ...
 
 
 class EETileSource(TileSource):
-    def get_raster_data(self, scene: 'Scene') -> xr.DataArray:
+    def get_raster_data(self, scene: 'Scene') -> xr.Dataset:
         _cache_path = cache_path(class_name(self), f'{scene.id}.tif')
         _cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -106,7 +106,7 @@ class Scene:
 
     @classmethod
     def load(cls: type['Scene'], path: Union[str, Path]) -> 'Scene':
-        return Scene()
+        raise NotImplementedError()
 
     def bounds(self, crs=None) -> Polygon:
         if crs is None:
@@ -124,6 +124,7 @@ class Scene:
             crs = self.crs
         return ee.Geometry.Polygon(list(self.bounds(crs).exterior.coords),
                     proj=str(crs), evenOdd=False)
+
     def get_coords(self):
         H, W = self.size
         y = np.arange(H) + 0.5

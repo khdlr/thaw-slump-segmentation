@@ -11,7 +11,7 @@ class Sentinel2(TileSource):
     def __init__(self, s2sceneid: str):
         self.s2sceneid = s2sceneid
 
-    def get_raster_data(self, scene: Scene) -> xr.DataArray:
+    def get_raster_data(self, scene: Scene) -> xr.Dataset:
         _cache_path = cache_path('Sentinel2', f'{scene.id}.tif')
         _cache_path.parent.mkdir(parents=True, exist_ok=True)
         if not _cache_path.exists():
@@ -65,7 +65,7 @@ class Sentinel2(TileSource):
             scene_id = f'{prefix}_{s2_id}'
             _cache_path = cache_path('Sentinel2', f'{scene_id}.tif')
             Sentinel2.download_tile(_cache_path, img, bounds)
-            ds = rioxarray.open_rasterio(_cache_path, decode_coords='all')
+            ds = rioxarray.open_rasterio(_cache_path)
 
             scene = Scene(
                 id=scene_id,

@@ -8,12 +8,18 @@ from .base import TileSource
 
 
 class Mask(TileSource):
-    def __init__(self, geometries: gpd.GeoSeries):
+    def __init__(self, geometries: gpd.GeoSeries, bounds: gpd.GeoSeries):
         self.geometries = geometries
+        self.bounds = bounds
 
     def get_raster_data(self, scene) -> xr.DataArray:
         mask = rasterize(self.geometries.to_crs(scene.crs),
                 out_shape=scene.size, transform=scene.transform)
+        is_valid = rasterize(self.bounds.to_crs(scene.crs),
+                out_shape=scene.size, transform=scene.transform)
+
+        # Set unlabelled regions to mask=255
+        mask = np.where(is_valid, mask, 255)
         mask = rearrange(mask, 'H W -> 1 H W')
 
         mask = xr.DataArray(mask,

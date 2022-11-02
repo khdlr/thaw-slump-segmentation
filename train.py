@@ -14,15 +14,16 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+import wandb
 
 import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
 
-from data_loading import get_loader, get_vis_loader, get_slump_loader, DataSources
+from data_loading import get_loader, DataSources, get_vis_loader
 from lib import Metrics, Accuracy, Precision, Recall, F1, IoU
-from lib.models import create_model, create_loss
+from lib import models
 from lib.utils import showexample, plot_metrics, plot_precision_recall, init_logging, get_logger, yaml_custom
 
 parser = argparse.ArgumentParser()
@@ -63,13 +64,7 @@ class Engine:
         self.config['model']['input_channels'] = sum(src.channels for src in self.data_sources)
 
         m = self.config['model']
-        self.model = create_model(
-            arch=m['architecture'],
-            encoder_name=m['encoder'],
-            encoder_weights=None if m['encoder_weights'] == 'random' else m['encoder_weights'],
-            classes=1,
-            in_channels=m['input_channels']
-        )
+        self.model = getattr(models, m['architecture'])(m)
 
         # make parallel
         self.model = nn.DataParallel(self.model)
@@ -98,7 +93,6 @@ class Engine:
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
         self.setup_lr_scheduler()
 
-        self.board_idx = 0
         self.epoch = 0
         self.metrics = Metrics(Accuracy, Precision, Recall, F1, IoU)
 
@@ -127,18 +121,14 @@ class Engine:
         self.checkpoints.mkdir()
 
         # Tensorboard initialization
-        from torch.utils.tensorboard import SummaryWriter
-        self.trn_writer = SummaryWriter(self.log_dir / 'train')
-        self.val_writer = SummaryWriter(self.log_dir / 'val')
-        self.trn_metrics = {}
-        self.val_metrics = {}
+        wandb.init(project='RTS Sentinel2', config=self.config)
 
     def run(self):
         for phase in self.config['schedule']:
             self.logger.info(f'Starting phase "{phase["phase"]}"')
             for epoch in range(phase['epochs']):
                 # Epoch setup
-                self.loss_function = create_loss(scoped_get('loss_function', phase, self.config)).to(self.dev)
+                self.loss_function = models.create_loss(scoped_get('loss_function', phase, self.config)).to(self.dev)
 
                 for step in phase['steps']:
                     if type(step) is dict:
@@ -154,7 +144,7 @@ class Engine:
                     elif command == 'validate_on':
                         # Validation step
                         data_loader = self.get_dataloader(key)
-                        self.val_epoch(data_loader)
+                        self.val_epoch(data_loader, key)
                     elif command == 'log_images':
                         self.log_images()
                 if self.scheduler:
@@ -171,7 +161,6 @@ class Engine:
             if 'batch_size' not in ds_config:
                 ds_config['batch_size'] = self.config['batch_size']
             ds_config['num_workers'] = self.config['data_threads']
-            ds_config['augment_types'] = self.config['datasets']
             ds_config['data_sources'] = self.data_sources
             ds_config['data_root'] = self.DATA_ROOT
             self.dataset_cache[name] = get_loader(**ds_config)
@@ -190,12 +179,11 @@ class Engine:
 
     def train_epoch(self, train_loader):
         self.epoch += 1
+        wandb.log({'epoch': self.epoch}, step=self.epoch)
         self.logger.info(f'Epoch {self.epoch} - Training Started')
         progress = tqdm(train_loader)
         self.model.train(True)
         for iteration, (img, target) in enumerate(progress):
-            self.board_idx += img.shape[0]
-
             img = img.to(self.dev, torch.float)
             target = target.to(self.dev, torch.long, non_blocking=True)
 
@@ -224,49 +212,40 @@ class Engine:
             with logfile.open('a') as f:
                 print(logstr, file=f)
 
-        for key, val in metrics_vals.items():
-            self.trn_writer.add_scalar(key, val, self.board_idx)
-            safe_append(self.trn_metrics, key, val)
-        safe_append(self.trn_metrics, 'step', self.board_idx)
-        safe_append(self.trn_metrics, 'epoch', self.epoch)
-        self.trn_writer.flush()
+        wandb.log({f'trn/{k}': v for k, v in metrics_vals.items()}, step=self.epoch)
 
         # Save model Checkpoint
         torch.save(self.model.state_dict(), self.checkpoints / f'{self.epoch:02d}.pt')
 
-    def val_epoch(self, val_loader):
+    @torch.no_grad()
+    def val_epoch(self, val_loader, tag):
         self.logger.info(f'Epoch {self.epoch} - Validation Started')
         self.metrics.reset()
         self.model.train(False)
-        with torch.no_grad():
-            for iteration, (img, target) in enumerate(val_loader):
-                img = img.to(self.dev, torch.float)
-                target = target.to(self.dev, torch.long, non_blocking=True)
-                y_hat = self.model(img).squeeze(1)
+        for iteration, (img, target) in enumerate(val_loader):
+            img = img.to(self.dev, torch.float)
+            target = target.to(self.dev, torch.long, non_blocking=True)
+            y_hat = self.model(img).squeeze(1)
+            loss = self.loss_function(y_hat, target)
+            if target.min() < 255:
+              self.metrics.step(y_hat, target, Loss=loss.detach())
 
-                loss = self.loss_function(y_hat, target)
-                self.metrics.step(y_hat, target, Loss=loss.detach())
+        m = self.metrics.evaluate()
+        self.metrics_vals_val = m
+        logstr = f'{self.epoch},' + ','.join(f'{val}' for key, val in m.items())
+        logfile = self.log_dir / '{tag}.csv'
+        self.logger.info(f'Epoch {self.epoch} - Validation Metrics: {m}')
+        if not logfile.exists():
+            # Print header upon first log print
+            header = 'Epoch,' + ','.join(f'{key}' for key, val in m.items())
+            with logfile.open('w') as f:
+                print(header, file=f)
+                print(logstr, file=f)
+        else:
+            with logfile.open('a') as f:
+                print(logstr, file=f)
 
-            m = self.metrics.evaluate()
-            self.metrics_vals_val = m
-            logstr = f'{self.epoch},' + ','.join(f'{val}' for key, val in m.items())
-            logfile = self.log_dir / 'val.csv'
-            self.logger.info(f'Epoch {self.epoch} - Validation Metrics: {m}')
-            if not logfile.exists():
-                # Print header upon first log print
-                header = 'Epoch,' + ','.join(f'{key}' for key, val in m.items())
-                with logfile.open('w') as f:
-                    print(header, file=f)
-                    print(logstr, file=f)
-            else:
-                with logfile.open('a') as f:
-                    print(logstr, file=f)
-            for key, val in m.items():
-                self.val_writer.add_scalar(key, val, self.board_idx)
-                safe_append(self.val_metrics, key, val)
-            safe_append(self.val_metrics, 'step', self.board_idx)
-            safe_append(self.val_metrics, 'epoch', self.epoch)
-            self.val_writer.flush()
+        wandb.log({f'{tag}/{k}': v for k, v in m.items()}, step=self.epoch)
 
     def log_images(self):
         self.logger.debug(f'Epoch {self.epoch} - Image Logging')
@@ -282,14 +261,10 @@ class Engine:
         (self.log_dir / 'tile_predictions').mkdir(exist_ok=True)
         for i, tile in enumerate(self.vis_names):
             filename = self.log_dir / 'tile_predictions' / f'{tile}.jpg'
-            showexample(self.vis_loader.dataset[i], self.vis_predictions[i],
-                        filename, self.data_sources, self.val_writer)
+            showexample(self.vis_loader.dataset[i], self.vis_predictions[i], tile, self.epoch)
 
         outdir = self.log_dir / 'metrics_plots'
         outdir.mkdir(exist_ok=True)
-        plot_metrics(self.trn_metrics, self.val_metrics, outdir=outdir)
-        plot_precision_recall(self.trn_metrics, self.val_metrics, outdir=outdir)
-        self.val_writer.flush()
 
     def setup_lr_scheduler(self):
         # Scheduler

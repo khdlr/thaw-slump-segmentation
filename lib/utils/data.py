@@ -125,13 +125,8 @@ class Augment(Dataset):
 
         return idx, (flipx, flipy, transpose)
 
-    def _get_nth_tensor_raw(self, idx, n):
-        """Hacky way of transparently accessing the underlying get_nth_tensor of a PTDataset"""
-        idx, ops = self._augmented_idx_and_ops(idx)
-        return self.dataset.get_nth_tensor(idx, n)
-
     def __len__(self):
-        return len(self.dataset) * 8
+        return len(self.dataset)
 
 
 class Transformed(Dataset):

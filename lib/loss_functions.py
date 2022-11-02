@@ -27,4 +27,4 @@ def auto_ce(y_hat, y):
         C = y_hat.shape[1]
         counts = torch.stack([(y == i).float().mean() for i in range(C)])
         weights = 1.0 / (C * counts)
-    return F.cross_entropy(y_hat, y.squeeze(1), weight=weights)
+    return F.cross_entropy(y_hat, y.squeeze(1), weight=weights, ignore_index=255)

@@ -52,21 +52,31 @@ def build_planet_cube(planet_file: Path, out_dir: Path):
     scene.save(out_dir / f'{scene.id}.nc')
 
 
-def build_sentinel2_cubes(scene_info, out_dir: Path):
+def build_sentinel2_cubes(site_poly, image_id, image_date, tiles, targets, out_dir: Path):
+    if any(out_dir.glob(f'{image_id}*')):
+      print(f'Skipping {image_id} as it has already been built')
+      return
     data.init_data_paths(out_dir.parent)
-    start_date = scene_info.image_date - pd.to_timedelta('5 days')
-    end_date = scene_info.image_date + pd.to_timedelta('5 days')
+
+    start_date = image_date - pd.to_timedelta('14 days')
+    end_date = image_date + pd.to_timedelta('14 days')
     scenes = data.Sentinel2.build_scenes(
-        bounds=scene_info.geometry, crs=None, 
+        bounds=site_poly, crs='EPSG:3995',
         start_date=start_date, end_date=end_date,
-        prefix=scene_info.image_id
+        prefix=image_id,
     )
+    print(f'Found {len(scenes)} scenes...')
+    mask = data.Mask(targets.geometry, tiles.geometry)
     for scene in scenes:
         complete_scene(scene)
-        scene.save(out_dir / f'{scene.id}.id')
+        scene.add_layer(mask)
+        scene.save(out_dir / f'{scene.id}.nc')
 
 
 def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Path):
+    if any(out_dir.glob(f'{image_id}*')):
+      print(f'Skipping {image_id} as it has already been built')
+      return
     data.init_data_paths(out_dir.parent)
 
     # Get tile dates
@@ -77,24 +87,25 @@ def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Pat
 
     # Build S2 Scenes
     # start_date = pd.to_datetime('2015-01-01')
-    start_date = pd.to_datetime(targets.image_date).min() - pd.to_timedelta('14 days')
-    end_date = pd.to_datetime('2022-09-20')
+    start_date = pd.to_datetime(targets.image_date).min() - pd.to_timedelta(365, unit='days')
+    end_date   = pd.to_datetime(targets.image_date).max() + pd.to_timedelta(2*365, unit='days')
+
     scenes = data.Sentinel2.build_scenes(
         bounds=site_poly, crs='EPSG:3995', 
         start_date=start_date, end_date=end_date,
-        prefix=image_id
+        prefix=image_id,
+        max_cloudy_pixels=5
     )
 
     x_scenes = defaultdict(list)
     for scene in tqdm(scenes):
         xarr = scene.to_xarray()
-        date = xarr.Sentinel2.date
+        date = pd.to_datetime(xarr.Sentinel2.date)
         xarr = xarr.expand_dims({'time': [date]}, axis=0)
-        xarr['Sentinel2'] = xarr['Sentinel2'] / 10000
         x_scenes[scene.crs].append((scene, xarr))
 
-    encoding = dict(Sentinel2={
-      'scale_factor': 1/255, 'add_offset': 0, 'dtype': 'uint8','_FillValue': 0})
+    # encoding = dict(Sentinel2={
+    #   'scale_factor': 1/255, 'add_offset': 0, 'dtype': 'uint8','_FillValue': 0})
     for crs in x_scenes:
       # Build Masks
       sample_scene = x_scenes[crs][0][0]
@@ -110,16 +121,40 @@ def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Pat
         xmasks.append(xmask)
 
       xarrs = [xarr for scene, xarr in x_scenes[crs]]
-      print('xarrs')
-      for x in xarrs:
-        print(x.Sentinel2.shape, x.dims)
-      print('xmasks')
-      for x in xmasks:
-        print(x.Mask.shape, x.dims)
       combined = xarray.combine_by_coords(xarrs + xmasks, combine_attrs='drop_conflicts')
-      combined.to_netcdf(out_dir / f'{image_id}_{crs}.nc', engine='h5netcdf', encoding=encoding)
+      combined.to_netcdf(out_dir / f'{image_id}_{crs}.nc', engine='h5netcdf')
 
     print(f'Done with build for scene {image_id}')
+
+
+def load_annotations(shapefile_root):
+    targets = map(gpd.read_file, shapefile_root.glob('*/TrainingLabel*.shp'))
+    targets = pd.concat(targets).to_crs('EPSG:3995').reset_index(drop=True)
+    targets['geometry'] = targets['geometry'].buffer(0)
+    targets['image_date'] = pd.to_datetime(targets['image_date'])
+    id2date = dict(targets[['image_id', 'image_date']].values)
+
+    scenes = map(gpd.read_file, shapefile_root.glob('*/ImageFootprints*.shp'))
+    scenes = pd.concat(scenes).to_crs('EPSG:3995').reset_index(drop=True)
+    scenes = scenes[scenes.image_id.isin(targets.image_id)]
+    scenes['geometry'] = scenes['geometry'].buffer(0)
+    scenes['image_date'] = scenes.image_id.apply(id2date.get)
+
+    # Semijoin targets and sites:
+    targets = targets[targets.image_id.isin(scenes.image_id)]
+
+    sites = unary_union(scenes.geometry)
+    sites = list(sites.geoms)
+
+    return targets, scenes, sites
+
+
+def run_jobs(function, n_jobs, out_dir, args_list):
+  if n_jobs == 0:
+    for args in tqdm(args_list):
+      function(*args, out_dir)
+  else:
+    Parallel(n_jobs=n_jobs)(delayed(function)(*args, out_dir) for args in args_list)
 
 
 if __name__ == "__main__":
@@ -142,65 +177,31 @@ if __name__ == "__main__":
         planet_files = list((DATA_ROOT / 'input').glob('*/*_SR*.tif'))
         out_dir = DATA_ROOT / 'planet_cubes'
 
-        if args.n_jobs == 0:
-            for planet_file in planet_files:
-                build_planet_cube(planet_file, out_dir)
-        else:
-            Parallel(n_jobs=args.n_jobs)(
-                delayed(build_planet_cube)(planet_file, out_dir) for planet_file in planet_files)
+        run_jobs(build_planet_cube, args.n_jobs, out_dir,
+                 [(f, ) for f in planet_files])
     elif args.mode == 'sentinel2':
         shapefile_root = DATA_ROOT / 'ML_training_labels' / 'retrogressive_thaw_slumps'
         out_dir = DATA_ROOT / 's2_cubes'
+        out_dir.mkdir(exist_ok=True)
+        targets, scenes, sites = load_annotations(shapefile_root)
 
-        labels = map(gpd.read_file, shapefile_root.glob('*/TrainingLabel*.shp'))
-        labels = pd.concat(labels).reset_index(drop=True)
-        labels['image_date'] = pd.to_datetime(labels['image_date'])
-        id2date = dict(labels[['image_id', 'image_date']].values)
-
-        scenes = map(gpd.read_file, shapefile_root.glob('*/ImageFootprints*.shp'))
-        scenes = pd.concat(scenes).reset_index(drop=True)
-        scenes = scenes[scenes.image_id.isin(labels.image_id)]
-        scenes['image_date'] = scenes.image_id.apply(id2date.get)
-
-        scene_info = scenes.loc[:, ['image_id', 'image_date', 'geometry']]
-        if args.n_jobs == 0:
-            for _, info in scene_info.iterrows():
-                build_sentinel2_cubes(info, out_dir)
-        else:
-            Parallel(n_jobs=args.n_jobs)(
-                delayed(build_sentinel2_cubes)(info, out_dir) for _, info in scene_info.iterrows())
+        scene_infos = []
+        for _, row in scenes.iterrows():
+          scene_infos.append((row.geometry, row.image_id, row.image_date,
+            scenes[scenes.image_id == row.image_id], # scenes
+            targets[targets.image_id == row.image_id], # targets
+          ))
+        run_jobs(build_sentinel2_cubes, args.n_jobs, out_dir, scene_infos)
     elif args.mode == 's2_timeseries':
         shapefile_root = DATA_ROOT / 'ML_training_labels' / 'retrogressive_thaw_slumps'
-        out_dir = DATA_ROOT / 's2_timeseries'
-
-        targets = []
-        for p in shapefile_root.glob('*/TrainingLabel*.shp'):
-            targets.append(gpd.read_file(p).to_crs('EPSG:3995'))
-        targets = pd.concat(targets)
-        targets['geometry'] = targets['geometry'].buffer(0)
-
-        scenes = []
-        for p in shapefile_root.glob('*/*Footprints*.shp'):
-            scenes.append(gpd.read_file(p).to_crs('EPSG:3995'))
-        scenes = pd.concat(scenes)
-        scenes['geometry'] = scenes['geometry'].buffer(0)
-
-        # Semijoin  targets and sites:
-        targets = targets[targets.image_id.isin(scenes.image_id)]
-        scenes = scenes[scenes.image_id.isin(targets.image_id)]
-
-        sites = unary_union(scenes.geometry)
-        sites = list(sites.geoms)
+        out_dir = DATA_ROOT / 's2_timeseries_cloudfree'
+        out_dir.mkdir(exist_ok=True)
+        targets, scenes, sites = load_annotations(shapefile_root)
 
         site_info = []
         for site_poly in sites:
             tiles = scenes[scenes.intersects(site_poly)].copy()
             site_id = tiles.iloc[tiles.area.argmax()].image_id
-            site_info.append((site_poly, site_id, tiles, targets[targets.image_id.isin(tiles.image_id)].copy()))
-
-        if args.n_jobs == 0:
-          for info in site_info[7:]:
-            build_sentinel2_timeseries(*info, out_dir)
-        else:
-            Parallel(n_jobs=args.n_jobs)(
-                delayed(build_sentinel2_timeseries)(*info, out_dir) for info in site_info)
+            site_info.append((
+              site_poly, site_id, tiles, targets[targets.image_id.isin(tiles.image_id)].copy()))
+        run_jobs(build_sentinel2_timeseries, args.n_jobs, out_dir, site_info)

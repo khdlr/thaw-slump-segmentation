@@ -1,4 +1,4 @@
-# Copyright (c) Ingmar Nitze and Konrad Heidler
+#Copyright (c) Ingmar Nitze and Konrad Heidler
 
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -6,6 +6,7 @@
 from datetime import datetime
 import logging
 import subprocess
+
 
 class ISO8601LoggingFormatter(logging.Formatter):
     def __init__(self, format_string):

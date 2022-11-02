@@ -15,7 +15,9 @@ class Sentinel2(TileSource):
         _cache_path = cache_path('Sentinel2', f'{scene.id}.tif')
         _cache_path.parent.mkdir(parents=True, exist_ok=True)
         if not _cache_path.exists():
-            Sentinel2.download_tile(_cache_path, self.s2sceneid, scene.ee_bounds())
+            utm_zone = s2sceneid.split('_')[-1][1:3]
+            crs = f'EPSG:326{utm_zone}'
+            Sentinel2.download_tile(_cache_path, self.s2sceneid, scene.ee_bounds(crs), crs=crs)
 
         data = rioxarray.open_rasterio(_cache_path)
         data = data.isel(band=[0,1,2,3,4,5,6,7,8,9,10,11,12])
@@ -23,7 +25,7 @@ class Sentinel2(TileSource):
         # But other tools don't seem to be compatible with that (i.e. QGIS)
         # data = data.assign_coords({'band': list(data.long_name[:13])})
         data = data.rename(band='Sentinel2_band')
-        data.attrs['date'] = pd.to_datetime(scene.id.split('_')[-3])
+        data.attrs['date'] = str(pd.to_datetime(scene.id.split('_')[-3]))
         return data
 
     @staticmethod
@@ -35,9 +37,13 @@ class Sentinel2(TileSource):
             img = gd.MaskedImage(img)
             safe_download(img, out_path,
                 region=bounds.getInfo(),
-                crs=None if crs is None else str(crs),
+                # crs=None if crs is None else str(crs),
+                crs=crs,
                 scale=10,
-                dtype='uint16')
+                dtype='uint16',
+                max_tile_size=2,
+                max_tile_dim=2000,
+            )
 
     @staticmethod
     def build_scenes(bounds, crs, start_date, end_date, prefix, min_coverage=90, max_cloudy_pixels=20):
@@ -83,7 +89,7 @@ class Sentinel2(TileSource):
 # cf. https://forum.step.esa.int/t/epsg-code-of-sentinel-2-images/17787
 # utm_zone = props['MGRS_TILE'][2]
 # utm_strip = props['MGRS_TILE'][:2]
-# if utm_zone in 'CDEFGHIJKLM':
+# if utm_zone in 'CDEFGHIJKLM':5000
 #     # UTM South
 #     crs = f'EPSG:327{utm_strip}'
 # elif utm_zone in 'NOPQRSTUVWX':

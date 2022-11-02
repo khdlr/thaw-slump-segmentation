@@ -48,8 +48,11 @@ class Metrics():
         if len(args) == 2:
             prediction = args[0]
             target = args[1]
-            yhat = (prediction > 0)
-            y    = (target > 0.5)
+
+            valid = target != 255
+            yhat = (prediction > 0)[valid]
+            y    = (target > 0.5)[valid]
+
             for agg in self.required_aggregators:
                 if agg not in self.state:
                     self.state[agg] = AGGREGATORS[agg](yhat, y)

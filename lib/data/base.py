@@ -35,7 +35,7 @@ class EETileSource(TileSource):
                 region=scene.ee_bounds().getInfo(),
                 crs=str(scene.crs),
                 crs_transform=scene.transform,
-                shape=scene.size,
+                shape=scene.size
             )
 
         data = rioxarray.open_rasterio(_cache_path)
@@ -102,7 +102,7 @@ class Scene:
         raise NotImplementedError()
 
     def save(self, path: Union[str, Path]):
-        self.to_xarray().to_netcdf(path)
+        self.to_xarray().to_netcdf(path, engine='h5netcdf')
 
     @classmethod
     def load(cls: type['Scene'], path: Union[str, Path]) -> 'Scene':

@@ -14,6 +14,7 @@ import os
 from collections import defaultdict
 import xarray
 from tqdm import tqdm
+import random
 
 import pandas as pd
 import geopandas as gpd
@@ -28,7 +29,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--n_jobs", default=-1, type=int, help="number of parallel joblib jobs")
 parser.add_argument("--data_dir", default='data', type=Path, help="Path to data processing dir")
 parser.add_argument("--log_dir", default='logs', type=Path, help="Path to log dir")
-parser.add_argument("--mode", default='planet', choices=['planet', 'sentinel2', 's2_timeseries'],
+parser.add_argument("--mode", default='planet',
+                    choices=['planet', 's2', 's2_timeseries', 's2_unlabelled'],
         help="The type of data cubes to build.")
 
 
@@ -60,17 +62,17 @@ def build_sentinel2_cubes(site_poly, image_id, image_date, tiles, targets, out_d
 
     start_date = image_date - pd.to_timedelta('14 days')
     end_date = image_date + pd.to_timedelta('14 days')
-    scenes = data.Sentinel2.build_scenes(
+    scene = data.Sentinel2.build_scene(
         bounds=site_poly, crs='EPSG:3995',
         start_date=start_date, end_date=end_date,
         prefix=image_id,
     )
-    print(f'Found {len(scenes)} scenes...')
-    mask = data.Mask(targets.geometry, tiles.geometry)
-    for scene in scenes:
-        complete_scene(scene)
-        scene.add_layer(mask)
-        scene.save(out_dir / f'{scene.id}.nc')
+    if scene is None:
+      print(f'No valid image found for {image_id}')
+      return
+    complete_scene(scene)
+    scene.add_layer(data.Mask(targets.geometry, tiles.geometry))
+    scene.save(out_dir / f'{scene.id}.nc')
 
 
 def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Path):
@@ -127,6 +129,22 @@ def build_sentinel2_timeseries(site_poly, image_id, tiles, targets, out_dir: Pat
     print(f'Done with build for scene {image_id}')
 
 
+def build_sentinel2_unlabelled(tile_id, out_dir: Path):
+    if any(out_dir.glob(f'{tile_id}*')):
+      print(f'Skipping {tile_id} as it has already been built')
+      return
+    data.init_data_paths(out_dir.parent)
+
+    random.seed(tile_id)
+    year = random.choice([2017, 2018, 2019, 2020, 2021])
+    start_date = f'{year}-07-01'
+    end_date = f'{year}-10-01'
+    scene = data.Sentinel2.scene_for_tile(tile_id,
+      start_date=start_date, end_date=end_date,
+    )
+    scene.save(out_dir / f'{scene.id}.nc')
+
+
 def load_annotations(shapefile_root):
     targets = map(gpd.read_file, shapefile_root.glob('*/TrainingLabel*.shp'))
     targets = pd.concat(targets).to_crs('EPSG:3995').reset_index(drop=True)
@@ -179,7 +197,7 @@ if __name__ == "__main__":
 
         run_jobs(build_planet_cube, args.n_jobs, out_dir,
                  [(f, ) for f in planet_files])
-    elif args.mode == 'sentinel2':
+    elif args.mode == 's2':
         shapefile_root = DATA_ROOT / 'ML_training_labels' / 'retrogressive_thaw_slumps'
         out_dir = DATA_ROOT / 's2_cubes'
         out_dir.mkdir(exist_ok=True)
@@ -205,3 +223,10 @@ if __name__ == "__main__":
             site_info.append((
               site_poly, site_id, tiles, targets[targets.image_id.isin(tiles.image_id)].copy()))
         run_jobs(build_sentinel2_timeseries, args.n_jobs, out_dir, site_info)
+    elif args.mode == 's2_unlabelled':
+      out_dir = DATA_ROOT / 's2_unlabelled'
+      out_dir.mkdir(exist_ok=True)
+
+      tiles = gpd.read_file(DATA_ROOT / 's2_unlabelled/index.geojson')
+      site_info = [(x,) for x in tiles.Name]
+      run_jobs(build_sentinel2_unlabelled, args.n_jobs, out_dir, site_info)

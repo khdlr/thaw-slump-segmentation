@@ -29,16 +29,13 @@ class Sentinel2(TileSource):
         return data
 
     @staticmethod
-    def download_tile(out_path, s2sceneid, bounds, crs=None):
+    def download_tile(out_path, s2sceneid, bounds=None, crs=None):
         if not out_path.exists():
             gd.Initialize()
             img = ee.Image(s2sceneid)
             img = img.select(['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B10','B11','B12'])
             img = gd.MaskedImage(img)
             safe_download(img, out_path,
-                region=bounds.getInfo(),
-                # crs=None if crs is None else str(crs),
-                crs=crs,
                 scale=10,
                 dtype='uint16',
                 max_tile_size=2,
@@ -46,7 +43,7 @@ class Sentinel2(TileSource):
             )
 
     @staticmethod
-    def build_scenes(bounds, crs, start_date, end_date, prefix, min_coverage=90, max_cloudy_pixels=20):
+    def build_scene(bounds, crs, start_date, end_date, prefix, min_coverage=90, max_cloudy_pixels=20):
         gd.Initialize()
         s2 = ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
         s2 = gd.MaskedCollection(s2)
@@ -64,23 +61,59 @@ class Sentinel2(TileSource):
           custom_filter=f'CLOUDY_PIXEL_PERCENTAGE < {max_cloudy_pixels}'
         )
 
-        scenes = []
+        metadata = imgs.properties
+        if len(metadata) == 0:
+          return None
+        best = max(metadata, key=lambda x: metadata[x]['CLOUDLESS_PORTION'])
+        assert metadata[best]['FILL_PORTION'] > 90
 
-        for img in imgs.properties:
-            s2_id = img.split('/')[-1]
-            scene_id = f'{prefix}_{s2_id}'
-            _cache_path = cache_path('Sentinel2', f'{scene_id}.tif')
-            Sentinel2.download_tile(_cache_path, img, bounds)
-            ds = rioxarray.open_rasterio(_cache_path)
+        s2_id = best.split('/')[-1]
 
-            scene = Scene(
-                id=scene_id,
-                crs=ds.rio.crs,
-                transform=ds.rio.transform(),
-                size=ds.shape[-2:],
-                layers=[Sentinel2(s2_id)])
-            scenes.append(scene)
-        return scenes
+        scene_id = f'{prefix}_{s2_id}'
+        _cache_path = cache_path('Sentinel2', f'{scene_id}.tif')
+        Sentinel2.download_tile(_cache_path, best, bounds)
+        ds = rioxarray.open_rasterio(_cache_path)
+
+        scene = Scene(
+            id=scene_id,
+            crs=ds.rio.crs,
+            transform=ds.rio.transform(),
+            size=ds.shape[-2:],
+            layers=[Sentinel2(s2_id)])
+        return scene
+
+    @staticmethod
+    def scene_for_tile(tile_id, start_date, end_date,
+                       max_cloudy_pixels=20):
+        gd.Initialize()
+        s2 = ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+        s2 = s2.filterMetadata('MGRS_TILE', 'equals', tile_id)
+        s2 = gd.MaskedCollection(s2)
+
+        imgs = s2.search(
+          start_date=start_date,
+          end_date=end_date,
+        )
+
+        metadata = imgs.properties
+        if len(metadata) == 0:
+          return None
+        best = max(metadata, key=lambda x: metadata[x]['CLOUDLESS_PORTION'])
+        assert metadata[best]['FILL_PORTION'] > 90
+
+        s2_id = best.split('/')[-1]
+        scene_id = f'{s2_id}'
+        _cache_path = cache_path('Sentinel2', f'{scene_id}.tif')
+        Sentinel2.download_tile(_cache_path, best)
+        ds = rioxarray.open_rasterio(_cache_path)
+
+        scene = Scene(
+            id=scene_id,
+            crs=ds.rio.crs,
+            transform=ds.rio.transform(),
+            size=ds.shape[-2:],
+            layers=[Sentinel2(s2_id)])
+        return scene
 
     def __repr__(self):
         return f'Sentinel2({self.s2sceneid})'

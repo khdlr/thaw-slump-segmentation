@@ -20,6 +20,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.ops import unary_union
 from joblib import Parallel, delayed
+import fsspec
 
 from lib import data
 from lib.utils import init_logging, get_logger
@@ -30,7 +31,7 @@ parser.add_argument("--n_jobs", default=-1, type=int, help="number of parallel j
 parser.add_argument("--data_dir", default='data', type=Path, help="Path to data processing dir")
 parser.add_argument("--log_dir", default='logs', type=Path, help="Path to log dir")
 parser.add_argument("--mode", default='planet',
-                    choices=['planet', 's2', 's2_timeseries', 's2_unlabelled'],
+                    choices=['planet', 's2', 's2_timeseries', 's2_unlabelled', 'qinghai'],
         help="The type of data cubes to build.")
 
 
@@ -167,6 +168,33 @@ def load_annotations(shapefile_root):
     return targets, scenes, sites
 
 
+def load_qinghai_annotations(data_folder):
+  SHAPEFILE_FOLDER = data_folder / 'cache' / 'qinghai'
+  origin = fsspec.get_mapper("zip::simplecache::https://download.pangaea.de/dataset/933957/files/RTS_inventory.zip")
+  target = fsspec.get_mapper(str(SHAPEFILE_FOLDER))
+  target.update(origin)
+  targets = gpd.read_file(next(SHAPEFILE_FOLDER.glob('**/RTS_Inventory.shp')))
+  return targets, ['46SDC', '46SDD', '46SDE']
+
+
+def build_sentinel2_qinghai(tile_id, targets, out_dir):
+    if any(out_dir.glob(f'qinghai_{tile_id}*')):
+      print(f'Skipping qinghai_{tile_id} as it has already been built')
+      return
+    data.init_data_paths(out_dir.parent)
+
+    scene = data.Sentinel2.scene_for_tile(tile_id,
+      start_date='2019-07-01', end_date='2019-08-31',
+    )
+    if scene is None:
+      return
+
+    scene.add_layer(
+        data.Mask(geometries=targets.geometry, bounds=None)
+    )
+    scene.save(out_dir / f'qinghai_{tile_id}.nc')
+
+
 def run_jobs(function, n_jobs, out_dir, args_list):
   if n_jobs == 0:
     for args in tqdm(args_list):
@@ -223,6 +251,12 @@ if __name__ == "__main__":
             site_info.append((
               site_poly, site_id, tiles, targets[targets.image_id.isin(tiles.image_id)].copy()))
         run_jobs(build_sentinel2_timeseries, args.n_jobs, out_dir, site_info)
+    elif args.mode == 'qinghai':
+      out_dir = DATA_ROOT / 's2_cubes'
+      out_dir.mkdir(exist_ok=True)
+      targets, tile_ids = load_qinghai_annotations(DATA_ROOT)
+      site_info = [(tile_id, targets) for tile_id in tile_ids]
+      run_jobs(build_sentinel2_qinghai, args.n_jobs, out_dir, site_info)
     elif args.mode == 's2_unlabelled':
       out_dir = DATA_ROOT / 's2_unlabelled'
       out_dir.mkdir(exist_ok=True)
